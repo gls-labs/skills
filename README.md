@@ -20,6 +20,7 @@ This repository contains reusable custom skills that can be installed through th
 ## Available skills
 
 * `semantic-commits`: Create git commits using Conventional Commit semantics (`feat` / `fix` / `chore` / `refactor` / `docs` / `test` / `build` / `ci` / `perf` / `revert` / `style`).
+* `gh-pr-from-jira-ticket`: Create and open GitHub pull requests from Jira tickets using `gh pr create`, defaulting the base branch to `dev` unless a base is explicitly provided.
 
 ## Skill structure
 

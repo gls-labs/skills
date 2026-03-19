@@ -1,0 +1,4 @@
+interface:
+  display_name: "GH PR From Jira"
+  short_description: "Create Jira-based GitHub PRs to dev or a specified base."
+  default_prompt: "Use this skill to open a GitHub PR titled from a Jira ticket and body template, defaulting base branch to dev unless provided."
