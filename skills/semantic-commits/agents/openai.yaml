@@ -1,0 +1,4 @@
+interface:
+  display_name: "Semantic Commits"
+  short_description: "Create Conventional Commit messages and commits"
+  default_prompt: "Create a semantic commit for current changes."
