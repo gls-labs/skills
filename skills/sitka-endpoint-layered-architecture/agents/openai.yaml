@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sitka Endpoint Builder"
+  short_description: "Build layered Vercel endpoints for Sitka"
+  default_prompt: "Use $sitka-endpoint-layered-architecture to implement a new API endpoint with route, controller, service, utility reuse, OpenAPI docs, and validation."

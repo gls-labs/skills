@@ -2,18 +2,9 @@
 
 Shared skills for the team.
 
-## Available skills
-
-- semantic-commits: Create git commits using Conventional Commit semantics (feat/fix/chore/refactor/docs/test/build/ci/perf/revert/style).
-
 ## Notes
 
 Each skill is packaged as a folder with a `SKILL.md` file and optional supporting files.
-
-
-# skills
-
-Shared Codex skills for the team.
 
 This repository contains reusable custom skills that can be installed through the Codex Skill Installer, either from the Codex app or from an active Codex session in the terminal.
 
@@ -21,6 +12,8 @@ This repository contains reusable custom skills that can be installed through th
 
 * `semantic-commits`: Create git commits using Conventional Commit semantics (`feat` / `fix` / `chore` / `refactor` / `docs` / `test` / `build` / `ci` / `perf` / `revert` / `style`).
 * `gh-pr-from-jira-ticket`: Create and open GitHub pull requests from Jira tickets using `gh pr create`, defaulting the base branch to `dev` unless a base is explicitly provided.
+* `sitka-endpoint-layered-architecture`: Implement Vercel Functions endpoints with clear separation of concerns and zero duplicated helper logic.
+* `endpoint-handoff-doc`: Generate endpoint handoff docs for frontend/client implementation by extracting request, validation, response, and error details from backend routes/controllers/services/OpenAPI.
 
 ## Skill structure
 

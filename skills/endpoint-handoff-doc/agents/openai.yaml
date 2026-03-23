@@ -1,0 +1,4 @@
+interface:
+  display_name: "Endpoint Handoff Doc"
+  short_description: "Generate frontend-ready endpoint implementation docs"
+  default_prompt: "Use $endpoint-handoff-doc to produce a detailed frontend handoff document for one backend endpoint from this codebase."
