@@ -1,0 +1,576 @@
+name: Codex pull request review
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'Pull request number to review'
+        required: true
+        type: number
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.resolve_pr.outputs.pr_number }}
+      base_ref: ${{ steps.resolve_pr.outputs.base_ref }}
+      head_ref: ${{ steps.resolve_pr.outputs.head_ref }}
+      should_run: ${{ steps.change_scope.outputs.should_run }}
+      workers_json: ${{ steps.discover_workers.outputs.workers_json || '[]' }}
+      worker_count: ${{ steps.discover_workers.outputs.worker_count || '0' }}
+      skipped_workers: ${{ steps.discover_workers.outputs.skipped_workers || '[]' }}
+    steps:
+      - name: Resolve PR metadata
+        id: resolve_pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = Number('${{ inputs.pr_number }}');
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('workflow_call requires a valid numeric pr_number input.');
+              return;
+            }
+
+            const response = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const prData = response.data;
+
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('base_ref', prData.base.ref);
+            core.setOutput('head_ref', prData.head.ref);
+
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ steps.resolve_pr.outputs.pr_number }}/merge
+
+      - name: Check PR scope (skip docs-only)
+        id: change_scope
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = Number('${{ steps.resolve_pr.outputs.pr_number }}');
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const isDocPath = (filename) =>
+              filename.startsWith('docs/') ||
+              filename.endsWith('.md');
+
+            const docsOnly = files.length > 0 && files.every((file) => isDocPath(file.filename));
+            core.info(`Changed files: ${files.length}`);
+            core.info(`Docs-only PR: ${docsOnly}`);
+            core.setOutput('should_run', docsOnly ? 'false' : 'true');
+
+      - name: Discover worker prompts
+        id: discover_workers
+        if: steps.change_scope.outputs.should_run == 'true'
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const outputFile = process.env.GITHUB_OUTPUT;
+          const promptDir = path.join('.github', 'codex', 'prompts');
+          const consolidateName = 'consolidate.md';
+          const maxWorkers = 6;
+
+          const allMarkdownFiles = fs
+            .readdirSync(promptDir)
+            .filter((name) => name.endsWith('.md'))
+            .sort();
+
+          const consolidatePath = path.join(promptDir, consolidateName);
+          if (!fs.existsSync(consolidatePath)) {
+            console.error(`Missing required consolidator prompt: ${consolidatePath}`);
+            process.exit(1);
+          }
+
+          const consolidateSize = fs.statSync(consolidatePath).size;
+          if (consolidateSize === 0) {
+            console.error(`Consolidator prompt is empty: ${consolidatePath}`);
+            process.exit(1);
+          }
+
+          const workerCandidates = allMarkdownFiles.filter((name) => {
+            return name === 'review.md' || /^review-.*\.md$/.test(name);
+          });
+
+          const usedIds = new Set();
+          const workers = [];
+          const skippedWorkers = [];
+
+          for (const name of workerCandidates) {
+            const filePath = path.join(promptDir, name);
+            const fileSize = fs.statSync(filePath).size;
+            if (fileSize === 0) {
+              skippedWorkers.push(name);
+              continue;
+            }
+
+            const rawId = path.basename(name, '.md').replace(/[^a-zA-Z0-9_-]/g, '_');
+            let uniqueId = rawId;
+            let suffix = 1;
+            while (usedIds.has(uniqueId)) {
+              uniqueId = `${rawId}_${suffix}`;
+              suffix += 1;
+            }
+            usedIds.add(uniqueId);
+
+            workers.push({
+              id: uniqueId,
+              prompt: path.posix.join('.github', 'codex', 'prompts', name),
+            });
+          }
+
+          if (workers.length === 0) {
+            console.error('No worker prompts found. Add review.md or review-*.md in .github/codex/prompts.');
+            process.exit(1);
+          }
+
+          if (workers.length > maxWorkers) {
+            console.error(`Too many worker prompts (${workers.length}). Max allowed is ${maxWorkers}.`);
+            process.exit(1);
+          }
+
+          fs.appendFileSync(outputFile, `workers_json=${JSON.stringify(workers)}\n`);
+          fs.appendFileSync(outputFile, `worker_count=${workers.length}\n`);
+          fs.appendFileSync(outputFile, `skipped_workers=${JSON.stringify(skippedWorkers)}\n`);
+          NODE
+
+  codex_workers:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare.outputs.workers_json) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+
+      - name: Pre-fetch base and head refs
+        run: |
+          git fetch --no-tags origin \
+            ${{ needs.prepare.outputs.base_ref }} \
+            +refs/pull/${{ needs.prepare.outputs.pr_number }}/head
+
+      - name: Run worker Codex review
+        id: run_codex
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ matrix.worker.prompt }}
+          output-file: codex-worker-output.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+
+      - name: Persist worker result
+        if: always()
+        run: |
+          mkdir -p worker-result
+          cp codex-worker-output.md worker-result/codex-output.md 2>/dev/null || touch worker-result/codex-output.md
+          printf '%s\n' '${{ matrix.worker.id }}' > worker-result/worker-id.txt
+          printf '%s\n' '${{ matrix.worker.prompt }}' > worker-result/prompt-file.txt
+          printf '%s\n' '${{ steps.run_codex.outcome }}' > worker-result/outcome.txt
+          printf '%s' '${{ steps.run_codex.outputs.final-message }}' > worker-result/final-message.txt
+
+      - name: Upload worker artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.worker.id }}
+          path: worker-result
+
+  codex_consolidate:
+    runs-on: ubuntu-latest
+    needs: [prepare, codex_workers]
+    if: always() && needs.prepare.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      final_message: ${{ steps.run_consolidator.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+
+      - name: Pre-fetch base and head refs
+        run: |
+          git fetch --no-tags origin \
+            ${{ needs.prepare.outputs.base_ref }} \
+            +refs/pull/${{ needs.prepare.outputs.pr_number }}/head
+
+      - name: Download worker artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: worker-results
+          pattern: worker-*
+          merge-multiple: false
+
+      - name: Build consolidator runtime prompt
+        run: |
+          runtime_prompt=.github/codex/prompts/.consolidate.runtime.md
+          cp .github/codex/prompts/consolidate.md "$runtime_prompt"
+          {
+            echo
+            echo '## Worker Execution Context'
+            echo
+            echo "Worker count: ${{ needs.prepare.outputs.worker_count }}"
+            echo "Skipped worker prompts: ${{ needs.prepare.outputs.skipped_workers }}"
+            echo
+            echo '## Worker Outputs'
+            echo
+          } >> "$runtime_prompt"
+
+          for dir in worker-results/worker-*; do
+            [ -d "$dir" ] || continue
+            worker_id="$(cat "$dir/worker-id.txt" 2>/dev/null || echo unknown)"
+            prompt_file="$(cat "$dir/prompt-file.txt" 2>/dev/null || echo unknown)"
+            outcome="$(cat "$dir/outcome.txt" 2>/dev/null || echo unknown)"
+            {
+              echo "### Worker: ${worker_id}"
+              echo
+              echo "- Prompt: \`${prompt_file}\`"
+              echo "- Outcome: \`${outcome}\`"
+              echo
+              echo '#### final-message output'
+              echo
+              if [ -s "$dir/final-message.txt" ]; then
+                cat "$dir/final-message.txt"
+              else
+                echo '_No final-message returned._'
+              fi
+              echo
+              echo '#### output-file content'
+              echo
+              if [ -s "$dir/codex-output.md" ]; then
+                cat "$dir/codex-output.md"
+              else
+                echo '_No output-file content returned._'
+              fi
+              echo
+            } >> "$runtime_prompt"
+          done
+
+      - name: Run consolidator Codex review
+        id: run_consolidator
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/.consolidate.runtime.md
+          output-file: codex-consolidated-output.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+
+  post_feedback:
+    runs-on: ubuntu-latest
+    needs: [prepare, codex_consolidate]
+    if: always() && needs.prepare.outputs.should_run == 'true' && needs.codex_consolidate.outputs.final_message != ''
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post Codex feedback
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number('${{ needs.prepare.outputs.pr_number }}');
+            const rawMessage = process.env.CODEX_FINAL_MESSAGE || '';
+
+            const toArray = (value) => (Array.isArray(value) ? value : []);
+
+            const parseConsolidatedPayload = (raw) => {
+              const trimmed = String(raw || '').trim();
+              if (!trimmed) return null;
+
+              try {
+                return JSON.parse(trimmed);
+              } catch {}
+
+              const fenced = trimmed.match(/```json\s*([\s\S]*?)\s*```/i);
+              if (fenced?.[1]) {
+                try {
+                  return JSON.parse(fenced[1]);
+                } catch {}
+              }
+
+              const firstBrace = trimmed.indexOf('{');
+              const lastBrace = trimmed.lastIndexOf('}');
+              if (firstBrace >= 0 && lastBrace > firstBrace) {
+                try {
+                  return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+                } catch {}
+              }
+
+              return null;
+            };
+
+            const parseRightSideLinesFromPatch = (patch) => {
+              const reviewable = new Set();
+              if (!patch || typeof patch !== 'string') return reviewable;
+
+              const lines = patch.split('\n');
+              let nextNewLine = null;
+
+              for (const line of lines) {
+                if (line.startsWith('@@')) {
+                  const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                  nextNewLine = match ? Number(match[1]) : null;
+                  continue;
+                }
+
+                if (nextNewLine === null) continue;
+
+                if (line.startsWith('+') && !line.startsWith('+++')) {
+                  reviewable.add(nextNewLine);
+                  nextNewLine += 1;
+                  continue;
+                }
+
+                if (line.startsWith('-') && !line.startsWith('---')) {
+                  continue;
+                }
+
+                reviewable.add(nextNewLine);
+                nextNewLine += 1;
+              }
+
+              return reviewable;
+            };
+
+            const findNearestLine = (target, sortedCandidates) => {
+              if (!sortedCandidates.length) return null;
+              let nearest = sortedCandidates[0];
+              let nearestDistance = Math.abs(target - nearest);
+              for (const candidate of sortedCandidates) {
+                const distance = Math.abs(target - candidate);
+                if (distance < nearestDistance) {
+                  nearest = candidate;
+                  nearestDistance = distance;
+                }
+              }
+              return nearest;
+            };
+
+            const makeFindingBody = (finding) => {
+              const severity = typeof finding?.severity === 'string' ? finding.severity.toLowerCase() : 'medium';
+              const title = typeof finding?.title === 'string' && finding.title.trim() ? finding.title.trim() : 'Finding';
+              const details = typeof finding?.body === 'string' ? finding.body.trim() : '';
+              return `**[${severity}] ${title}**\n\n${details || 'No details provided.'}`;
+            };
+
+            const payload = parseConsolidatedPayload(rawMessage);
+            if (!payload || typeof payload !== 'object') {
+              core.warning('Consolidator output is not valid JSON. Falling back to a regular PR comment.');
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body: rawMessage,
+              });
+              return;
+            }
+
+            const requestedEvent = String(payload.event || '').toUpperCase();
+            const event = ['REQUEST_CHANGES', 'COMMENT', 'APPROVE'].includes(requestedEvent)
+              ? requestedEvent
+              : 'COMMENT';
+
+            const summary = typeof payload.summary === 'string' && payload.summary.trim()
+              ? payload.summary.trim()
+              : 'Automated review completed.';
+
+            const blockingFindings = toArray(payload.blocking_findings);
+            const nonBlockingFindings = toArray(payload.non_blocking_findings);
+            const openQuestions = toArray(payload.open_questions)
+              .filter((q) => typeof q === 'string' && q.trim())
+              .map((q) => q.trim());
+            const checklist = toArray(payload.validation_checklist)
+              .filter((item) => item && typeof item.item === 'string' && item.item.trim());
+            const workerCoverage = toArray(payload.worker_coverage)
+              .filter((item) => item && typeof item.worker === 'string' && item.worker.trim());
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pullNumber,
+              per_page: 100,
+            });
+
+            const fileMap = new Map();
+            for (const file of files) {
+              const addedLines = parseRightSideLinesFromPatch(file.patch);
+              fileMap.set(file.filename, {
+                filename: file.filename,
+                addedLines,
+                addedLinesSorted: [...addedLines].sort((a, b) => a - b),
+              });
+            }
+
+            const normalizePath = (value) => {
+              if (typeof value !== 'string') return null;
+              const trimmed = value.trim().replace(/^\.\/+/, '');
+              return trimmed || null;
+            };
+
+            const inlineComments = [];
+            const generalFindings = [];
+
+            for (const finding of [...blockingFindings, ...nonBlockingFindings]) {
+              const path = normalizePath(finding?.path);
+              const line = Number(finding?.line);
+
+              if (!path || !Number.isInteger(line) || line <= 0) {
+                generalFindings.push(finding);
+                continue;
+              }
+
+              const file = fileMap.get(path);
+              if (!file || file.addedLinesSorted.length === 0) {
+                generalFindings.push(finding);
+                continue;
+              }
+
+              const resolvedLine = file.addedLines.has(line)
+                ? line
+                : findNearestLine(line, file.addedLinesSorted);
+              if (!resolvedLine) {
+                generalFindings.push(finding);
+                continue;
+              }
+
+              inlineComments.push({
+                path: file.filename,
+                line: resolvedLine,
+                side: 'RIGHT',
+                body: makeFindingBody(finding),
+              });
+            }
+
+            const maxInlineComments = 30;
+            const droppedInline = inlineComments.length > maxInlineComments
+              ? inlineComments.splice(maxInlineComments)
+              : [];
+
+            const reviewBodyLines = [
+              '# Codex Review',
+              '',
+              `Status: ${event}`,
+              '',
+              summary,
+              '',
+              '## Snapshot',
+              '',
+              `- Blocking findings: ${blockingFindings.length}`,
+              `- Non-blocking findings: ${nonBlockingFindings.length}`,
+              `- Open questions: ${openQuestions.length}`,
+              `- Inline comments posted: ${inlineComments.length}`,
+              '',
+            ];
+
+            if (generalFindings.length || droppedInline.length) {
+              reviewBodyLines.push('## Findings Without Exact Inline Anchor');
+              reviewBodyLines.push('');
+              for (const finding of generalFindings) {
+                const severity = typeof finding?.severity === 'string' ? finding.severity.toLowerCase() : 'medium';
+                const title = typeof finding?.title === 'string' && finding.title.trim() ? finding.title.trim() : 'Finding';
+                const path = normalizePath(finding?.path) || 'unknown file';
+                const line = Number.isInteger(Number(finding?.line)) ? String(Number(finding?.line)) : '?';
+                const details = typeof finding?.body === 'string' && finding.body.trim() ? finding.body.trim() : 'No details provided.';
+                reviewBodyLines.push(`- **[${severity}] ${title}** (${path}:${line})`);
+                reviewBodyLines.push(`  ${details}`);
+              }
+              if (droppedInline.length) {
+                reviewBodyLines.push(`- ${droppedInline.length} additional inline findings were omitted due to API comment limits.`);
+              }
+              reviewBodyLines.push('');
+            }
+
+            reviewBodyLines.push('## Open Questions');
+            reviewBodyLines.push('');
+            if (openQuestions.length) {
+              for (const question of openQuestions) {
+                reviewBodyLines.push(`- ${question}`);
+              }
+            } else {
+              reviewBodyLines.push('None.');
+            }
+            reviewBodyLines.push('');
+
+            reviewBodyLines.push('## Validation Checklist');
+            reviewBodyLines.push('');
+            if (checklist.length) {
+              for (const item of checklist) {
+                reviewBodyLines.push(`- [${item.checked ? 'x' : ' '}] ${item.item.trim()}`);
+              }
+            } else {
+              reviewBodyLines.push('- [ ] No checklist provided by consolidator.');
+            }
+            reviewBodyLines.push('');
+
+            if (workerCoverage.length) {
+              reviewBodyLines.push('## Worker Coverage');
+              reviewBodyLines.push('');
+              reviewBodyLines.push('| Worker | Outcome | Used | Notes |');
+              reviewBodyLines.push('| --- | --- | --- | --- |');
+              for (const item of workerCoverage) {
+                const worker = item.worker.trim();
+                const outcome = typeof item.outcome === 'string' && item.outcome.trim() ? item.outcome.trim() : 'unknown';
+                const used = item.used === true ? 'yes' : 'no';
+                const notes = typeof item.notes === 'string' && item.notes.trim() ? item.notes.trim() : '';
+                reviewBodyLines.push(`| ${worker} | ${outcome} | ${used} | ${notes} |`);
+              }
+              reviewBodyLines.push('');
+            }
+
+            const reviewBody = reviewBodyLines.join('\n').trim();
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+
+            try {
+              await github.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: pullNumber,
+                event,
+                body: reviewBody,
+                commit_id: pr.data.head.sha,
+                comments: inlineComments.length ? inlineComments : undefined,
+              });
+            } catch (error) {
+              core.warning(`Failed to create inline review: ${error.message}`);
+              await github.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: pullNumber,
+                event,
+                body: `${reviewBody}\n\n_Inline comments could not be posted due to API validation errors._`,
+                commit_id: pr.data.head.sha,
+              });
+            }
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex_consolidate.outputs.final_message }}
