@@ -180,7 +180,6 @@ jobs:
           output-file: codex-worker-output.md
           safety-strategy: drop-sudo
           sandbox: workspace-write
-          codex-home: ${{ runner.temp }}/codex-home-worker-${{ matrix.worker.id }}
 
       - name: Persist worker result
         if: always()
@@ -281,7 +280,6 @@ jobs:
           output-file: codex-consolidated-output.md
           safety-strategy: drop-sudo
           sandbox: workspace-write
-          codex-home: ${{ runner.temp }}/codex-home-consolidate
 
   post_feedback:
     runs-on: ubuntu-latest
