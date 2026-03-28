@@ -1,0 +1,23 @@
+name: Codex pull request review
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull request number to review'
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  run_codex_review:
+    uses: gls-labs/skills/.github/workflows/pr-review.yml@v1
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

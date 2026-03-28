@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup Code Reviewer Agents"
+  short_description: "Set up Codex PR review workflow and prompt scaffolding"
+  default_prompt: "Use $setup-code-reviewer-agents to set up the Codex code reviewer agents in this repository."
