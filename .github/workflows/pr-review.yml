@@ -3,9 +3,11 @@ on:
   workflow_call:
     inputs:
       pr_number:
-        description: 'Pull request number to review'
         required: true
         type: number
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 jobs:
   prepare:
