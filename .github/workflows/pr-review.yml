@@ -1,4 +1,4 @@
-name: Codex pull request review
+name: Codex Pull Request Review
 on:
   workflow_call:
     inputs:
